@@ -6,6 +6,7 @@ name: build_terraform
 # handle building and packing Terraform.
 
 on:
+  workflow_dispatch:
   workflow_call:
     inputs:
       cgo-enabled:
