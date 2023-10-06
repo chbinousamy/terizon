@@ -87,6 +87,7 @@ type NodeAbstractResource struct {
 var (
 	_ GraphNodeReferenceable               = (*NodeAbstractResource)(nil)
 	_ GraphNodeReferencer                  = (*NodeAbstractResource)(nil)
+	_ GraphNodeImportReferencer            = (*NodeAbstractResource)(nil)
 	_ GraphNodeProviderConsumer            = (*NodeAbstractResource)(nil)
 	_ GraphNodeProvisionerConsumer         = (*NodeAbstractResource)(nil)
 	_ GraphNodeConfigResource              = (*NodeAbstractResource)(nil)
@@ -205,11 +206,22 @@ func (n *NodeAbstractResource) References() []*addrs.Reference {
 		}
 	}
 
+	return result
+}
+
+func (n *NodeAbstractResource) ImportReferences() []*addrs.Reference {
+	var result []*addrs.Reference
 	for _, importTarget := range n.importTargets {
-		refs, _ := lang.ReferencesInExpr(addrs.ParseRef, importTarget.ID)
+		// legacy import won't have any config
+		if importTarget.Config == nil {
+			continue
+		}
+
+		refs, _ := lang.ReferencesInExpr(addrs.ParseRef, importTarget.Config.ID)
+		result = append(result, refs...)
+		refs, _ = lang.ReferencesInExpr(addrs.ParseRef, importTarget.Config.ForEach)
 		result = append(result, refs...)
 	}
-
 	return result
 }
 

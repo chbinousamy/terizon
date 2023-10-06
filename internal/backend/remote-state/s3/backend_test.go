@@ -1809,6 +1809,30 @@ func TestBackendWrongRegion(t *testing.T) {
 	}
 }
 
+func TestBackendS3ObjectLock(t *testing.T) {
+	testACC(t)
+
+	ctx := context.TODO()
+
+	bucketName := fmt.Sprintf("terraform-remote-s3-test-%x", time.Now().Unix())
+	keyName := "testState"
+
+	b := backend.TestBackendConfig(t, New(), backend.TestWrapConfig(map[string]interface{}{
+		"bucket":  bucketName,
+		"key":     keyName,
+		"encrypt": true,
+		"region":  "us-west-1",
+	})).(*Backend)
+
+	createS3Bucket(ctx, t, b.s3Client, bucketName, b.awsConfig.Region,
+		s3BucketWithVersioning,
+		s3BucketWithObjectLock(s3types.ObjectLockRetentionModeCompliance),
+	)
+	defer deleteS3Bucket(ctx, t, b.s3Client, bucketName, b.awsConfig.Region)
+
+	backend.TestBackendStates(t, b)
+}
+
 func TestKeyEnv(t *testing.T) {
 	testACC(t)
 
@@ -2001,8 +2025,12 @@ func TestAssumeRole_PrepareConfigValidation(t *testing.T) {
 			},
 		},
 
-		// NOT SUPPORTED by `aws-sdk-go-base/v1`
-		// "source_identity"
+		"source_identity": {
+			config: map[string]cty.Value{
+				"role_arn":        cty.StringVal("arn:aws:iam::123456789012:role/testrole"),
+				"source_identity": cty.StringVal("source-identity"),
+			},
+		},
 
 		"with tags": {
 			config: map[string]cty.Value{
@@ -2046,6 +2074,93 @@ func TestAssumeRole_PrepareConfigValidation(t *testing.T) {
 	}
 }
 
+// TestBackend_CoerceValue verifies a cty.Object can be coerced into
+// an s3 backend Block
+//
+// This serves as a smoke test for use of the terraform_remote_state
+// data source with the s3 backend, replicating the the process that
+// data source uses. The returned value is ignored as the object is
+// large (representing the entire s3 backend schema) and the focus of
+// this test is early detection of coercion failures.
+func TestBackend_CoerceValue(t *testing.T) {
+	testCases := map[string]struct {
+		Input   cty.Value
+		WantErr string
+	}{
+		"basic": {
+			Input: cty.ObjectVal(map[string]cty.Value{
+				"bucket": cty.StringVal("test"),
+				"key":    cty.StringVal("test"),
+			}),
+		},
+		"missing bucket": {
+			Input: cty.ObjectVal(map[string]cty.Value{
+				"key": cty.StringVal("test"),
+			}),
+			WantErr: `attribute "bucket" is required`,
+		},
+		"missing key": {
+			Input: cty.ObjectVal(map[string]cty.Value{
+				"bucket": cty.StringVal("test"),
+			}),
+			WantErr: `attribute "key" is required`,
+		},
+		"assume_role": {
+			Input: cty.ObjectVal(map[string]cty.Value{
+				"bucket": cty.StringVal("test"),
+				"key":    cty.StringVal("test"),
+				"assume_role": cty.ObjectVal(map[string]cty.Value{
+					"role_arn": cty.StringVal("test"),
+				}),
+			}),
+		},
+		"assume_role missing role_arn": {
+			Input: cty.ObjectVal(map[string]cty.Value{
+				"bucket":      cty.StringVal("test"),
+				"key":         cty.StringVal("test"),
+				"assume_role": cty.ObjectVal(map[string]cty.Value{}),
+			}),
+			WantErr: `.assume_role: attribute "role_arn" is required`,
+		},
+		"assume_role_with_web_identity": {
+			Input: cty.ObjectVal(map[string]cty.Value{
+				"bucket": cty.StringVal("test"),
+				"key":    cty.StringVal("test"),
+				"assume_role_with_web_identity": cty.ObjectVal(map[string]cty.Value{
+					"role_arn": cty.StringVal("test"),
+				}),
+			}),
+		},
+		"assume_role_with_web_identity missing role_arn": {
+			Input: cty.ObjectVal(map[string]cty.Value{
+				"bucket":                        cty.StringVal("test"),
+				"key":                           cty.StringVal("test"),
+				"assume_role_with_web_identity": cty.ObjectVal(map[string]cty.Value{}),
+			}),
+			WantErr: `.assume_role_with_web_identity: attribute "role_arn" is required`,
+		},
+	}
+
+	for name, test := range testCases {
+		t.Run(name, func(t *testing.T) {
+			b := Backend{}
+			// Skip checking the returned cty.Value as this object will be large.
+			_, gotErrObj := b.ConfigSchema().CoerceValue(test.Input)
+
+			if gotErrObj == nil {
+				if test.WantErr != "" {
+					t.Fatalf("coersion succeeded; want error: %q", test.WantErr)
+				}
+			} else {
+				gotErr := tfdiags.FormatError(gotErrObj)
+				if gotErr != test.WantErr {
+					t.Fatalf("wrong error\ngot:  %s\nwant: %s", gotErr, test.WantErr)
+				}
+			}
+		})
+	}
+}
+
 func testGetWorkspaceForKey(b *Backend, key string, expected string) error {
 	if actual := b.keyEnv(key); actual != expected {
 		return fmt.Errorf("incorrect workspace for key[%q]. Expected[%q]: Actual[%q]", key, expected, actual)
@@ -2065,16 +2180,31 @@ func checkStateList(b backend.Backend, expected []string) error {
 	return nil
 }
 
-func createS3Bucket(ctx context.Context, t *testing.T, s3Client *s3.Client, bucketName, region string) {
+type createS3BucketOptions struct {
+	versioning     bool
+	objectLockMode s3types.ObjectLockRetentionMode
+}
+
+type createS3BucketOptionsFunc func(*createS3BucketOptions)
+
+func createS3Bucket(ctx context.Context, t *testing.T, s3Client *s3.Client, bucketName, region string, optFns ...createS3BucketOptionsFunc) {
 	t.Helper()
 
+	var opts createS3BucketOptions
+	for _, f := range optFns {
+		f(&opts)
+	}
+
 	createBucketReq := &s3.CreateBucketInput{
-		Bucket: &bucketName,
+		Bucket: aws.String(bucketName),
 	}
 	if region != "us-east-1" {
 		createBucketReq.CreateBucketConfiguration = &s3types.CreateBucketConfiguration{
 			LocationConstraint: s3types.BucketLocationConstraint(region),
 		}
+	}
+	if opts.objectLockMode != "" {
+		createBucketReq.ObjectLockEnabledForBucket = true
 	}
 
 	// Be clear about what we're doing in case the user needs to clean
@@ -2083,6 +2213,46 @@ func createS3Bucket(ctx context.Context, t *testing.T, s3Client *s3.Client, buck
 	_, err := s3Client.CreateBucket(ctx, createBucketReq, s3WithRegion(region))
 	if err != nil {
 		t.Fatal("failed to create test S3 bucket:", err)
+	}
+
+	if opts.versioning {
+		_, err := s3Client.PutBucketVersioning(ctx, &s3.PutBucketVersioningInput{
+			Bucket: aws.String(bucketName),
+			VersioningConfiguration: &s3types.VersioningConfiguration{
+				Status: s3types.BucketVersioningStatusEnabled,
+			},
+		})
+		if err != nil {
+			t.Fatalf("failed enabling versioning: %s", err)
+		}
+	}
+
+	if opts.objectLockMode != "" {
+		_, err = s3Client.PutObjectLockConfiguration(ctx, &s3.PutObjectLockConfigurationInput{
+			Bucket: aws.String(bucketName),
+			ObjectLockConfiguration: &s3types.ObjectLockConfiguration{
+				ObjectLockEnabled: s3types.ObjectLockEnabledEnabled,
+				Rule: &s3types.ObjectLockRule{
+					DefaultRetention: &s3types.DefaultRetention{
+						Days: 1,
+						Mode: opts.objectLockMode,
+					},
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("failed enabling object locking: %s", err)
+		}
+	}
+}
+
+func s3BucketWithVersioning(opts *createS3BucketOptions) {
+	opts.versioning = true
+}
+
+func s3BucketWithObjectLock(mode s3types.ObjectLockRetentionMode) createS3BucketOptionsFunc {
+	return func(opts *createS3BucketOptions) {
+		opts.objectLockMode = mode
 	}
 }
 
