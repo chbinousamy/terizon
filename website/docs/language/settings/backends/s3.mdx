@@ -174,6 +174,7 @@ The following configuration is optional:
 * `shared_credentials_files`  - (Optional) List of paths to AWS shared credentials files. Defaults to `~/.aws/credentials`.
 * `skip_credentials_validation` - (Optional) Skip credentials validation via the STS API.
 * `skip_region_validation` - (Optional) Skip validation of provided region name.
+* `skip_requesting_account_id` - (Optional) Whether to skip requesting the account ID. Useful for AWS API implementations that do not have the IAM, STS API, or metadata API.
 * `skip_metadata_api_check` - (Optional) Skip usage of EC2 Metadata API.
 * `sts_endpoint` - (Optional, **Deprecated**) Custom endpoint URL for the AWS Security Token Service (STS) API.
   Use `endpoints.sts` instead.
@@ -242,7 +243,7 @@ terraform {
     bucket = "terraform-state-prod"
     key    = "network/terraform.tfstate"
     region = "us-east-1"
-    assume_role {
+    assume_role = {
       role_arn = "arn:aws:iam::PRODUCTION-ACCOUNT-ID:role/Terraform"
     }
   }
@@ -276,7 +277,7 @@ terraform {
     bucket = "terraform-state-prod"
     key    = "network/terraform.tfstate"
     region = "us-east-1"
-    assume_role_with_web_identity {
+    assume_role_with_web_identity = {
       role_arn           = "arn:aws:iam::PRODUCTION-ACCOUNT-ID:role/Terraform"
       web_identity_token = "<token value>"
     }
@@ -424,7 +425,7 @@ provider "aws" {
   # No credentials explicitly set here because they come from either the
   # environment or the global credentials file.
 
-  assume_role {
+  assume_role = {
     role_arn = "${var.workspace_iam_roles[terraform.workspace]}"
   }
 }
